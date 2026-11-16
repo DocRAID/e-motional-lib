@@ -1,0 +1,22 @@
+[package]
+name = "e-motional-lib"
+version = "0.1.0"
+edition = "2021"
+description = "Touchpad edge motion daemon for Linux"
+license = "MIT"
+
+[features]
+default = ["x11"]
+x11 = ["enigo/x11rb"]
+wayland = ["enigo/wayland"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+enigo = { version = "0.6.1", default-features = false }
+env_logger = "0.11"
+evdev = "0.13"
+libc = "0.2"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+udev = "0.9"
