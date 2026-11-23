@@ -2,14 +2,16 @@
 
 [English](README.md)
 
-손가락 하나가 터치패드 가장자리에 도달하면 포인터를 계속 움직입니다.
-클릭을 누르고 있어도, 누르지 않아도 사용할 수 있습니다. Rust로 작성한 Linux 시스템
-서비스이며, 이름과 달리 재사용 가능한 라이브러리가 아닙니다.
+윈도우의 Edge motion을  Rust로 작성한 Linux 시스템 서비스로 비슷하게 구현한 프로젝트 입니다.
+Windows 기반 laptop에는 기본적으로 적용되지만, linux에서도 사용하기 위해 만들어졌습니다.
 
-실제 터치패드 이벤트는 변경하지 않습니다. 선택한 evdev 장치를 독점(grab)하지 않고
-읽으며, 별도의 최소 기능 uinput 장치를 통해 상대 포인터 이동만 추가합니다.
-클릭, 키보드 입력, 스크롤, 제스처는 생성하지 않습니다. X11/Wayland별 빌드,
-디스플레이 서버 인증 정보, input 그룹 가입, udev 권한 규칙은 필요하지 않습니다.
+터치패드 가장자리에 도달하면 포인터를 계속 움직입니다.
+
+!서비스이며, 이름과 달리 재사용 가능한 라이브러리가 아닙니다!
+
+선택한 evdev 장치를 독점 없이 read만 하며, uinput 장치를 통해 상대 포인터 이동만 추가하는 방식 입니다.
+
+동작을 위한 최소 권한을 가진 root broker를 생성하며 input 그룹 가입, udev 권한 규칙은 필요하지 않습니다.
 
 ## 설치
 
@@ -23,8 +25,6 @@
   pkg-config, libudev 및 libsystemd 개발 파일, curl, 표준 GNU 사용자 공간 도구.
   특정 사용자의 홈 디렉터리에만 설치된 Rust 툴체인은 격리된 빌더에서 의도적으로
   접근할 수 없습니다.
-- GitHub와 Cargo 의존성 레지스트리에 접근할 수 있는 인터넷 연결 및 대화형 보정을 위한
-  제어 터미널.
 
 Arch Linux에서는 다음 명령으로 필수 패키지를 설치합니다.
 
@@ -37,8 +37,8 @@ sudo pacman -S --needed base-devel rust pkgconf systemd curl
 설정을 기록하거나 장치 권한, 계정, 그룹, ACL, udev 규칙을 변경하지 않습니다.
 커널이나 보안 정책이 로드 또는 접근을 막으면 정책을 자동으로 바꾸지 않고 실패합니다.
 
-설치와 보정을 마친 뒤 서비스를 명시적으로 활성화합니다.
 
+다음 명령으로 설치 및 터치패드 보정 작업, 서비스 활성화를 합니다.
 ```sh
 curl -fsSL https://raw.githubusercontent.com/DocRAID/e-motional-lib/main/install.sh | sudo sh
 sudo systemctl enable --now e-motional-lib
@@ -46,7 +46,7 @@ sudo systemctl enable --now e-motional-lib
 
 첫 번째 명령은 파이프로 실행해도 대화형으로 동작합니다. 보정 입력은 `/dev/tty`에서
 읽습니다. 사용할 터치패드를 선택하고 모든 손가락을 뗀 다음, 손가락 하나로 네 가장자리와
-모서리를 포함한 전체 표면을 훑습니다. Enter로 측정을 마치고 가로/세로 가장자리 비율을
+모서리를 포함한 전체 표면을 훑습니다. Enter로 측정을 마치고 Edge-motion을 사용 할 X/Y 비율을
 선택합니다. 두 축 모두 측정 범위가 필요합니다. 다른 터치패드를 추가로 허용하려면
 나중에 설정을 다시 실행합니다.
 
@@ -96,7 +96,7 @@ curl 명령은 내려받은 설치 프로그램에 root 권한을 부여합니�
 의존성 소스를 신뢰해야 합니다. 설치 후 프로그램은 작은 root 브로커와 root 설정 코드를
 실행합니다.
 
-### Arch 패키지 / 개발용 체크아웃
+### 개발용 체크아웃
 
 저장소: `git@github.com:DocRAID/e-motional-lib.git`.
 
@@ -108,18 +108,6 @@ sudo mkdir -m 700 /etc/e-motional-lib   # only if it does not already exist
 sudo e-motional-lib --setup --config-path /etc/e-motional-lib/config.toml
 sudo systemctl enable --now e-motional-lib
 ```
-
-위 `mkdir` 명령은 디렉터리가 아직 없을 때만 실행합니다.
-
-PKGBUILD에는 전체 체크아웃이 필요하며, 모든 Rust 소스 모듈을 복사하고 사용자 유닛이
-아닌 시스템 유닛을 `/usr/lib/systemd/system`에 설치합니다. 기본 빌드 디렉터리는
-저장소의 `src/`와 충돌하지 않도록 `target/makepkg`입니다. 패키지 빌더용 일반
-`cargo test` check 함수를 포함합니다. `makepkg`를 root로 실행하지 마세요.
-컴파일만 하려면 `cargo build --release --locked`를 사용합니다.
-백엔드 환경 변수나 Enigo 기능 선택은 더 이상 사용하지 않습니다.
-
-이전 사용자 서비스는 자동으로 비활성화하거나 삭제하지 않습니다. 마이그레이션 전에
-해당 사용자 세션에서 직접 중지하세요.
 
 ```sh
 systemctl --user disable --now e-motional-lib.service
@@ -234,15 +222,6 @@ uinput은 X11 인증과 Wayland 프로토콜별 입력 주입을 피하지만, �
 
 ## 설정 및 운영
 
-서비스는 항상 `/etc/e-motional-lib/config.toml`을 사용합니다. root의 설정/목록 조회는
-기본적으로 이 경로를 사용하고 다른 `--config-path` 값은 거부합니다.
-일반 사용자의 설정/목록 조회는 `$HOME/.config/e-motional-lib.toml`을 기본값으로
-유지하며 다른 경로를 명시적으로 선택할 수 있습니다. root 브로커의 설정은 시스템
-경로로 고정됩니다. 상위 디렉터리는 root 소유 `0700`, 파일은 root 소유 `0600`의
-일반 파일이어야 하며 심볼릭 링크/하드 링크는 허용하지 않습니다. 일반 실행은 워커
-진입점이며 매니저가 제공하는 연결이 필요합니다. 별도의 독립 실행형 root 데몬 모드가
-아닙니다.
-
 다시 보정하거나 다른 터치패드를 허용 목록에 추가하려면 다음을 실행합니다.
 
 ```sh
@@ -251,59 +230,23 @@ sudo e-motional-lib --setup --config-path /etc/e-motional-lib/config.toml
 sudo systemctl start e-motional-lib
 ```
 
-설정은 장치를 선택하고 현재 좌표의 최솟값/최댓값을 기록한 뒤, 불안정한 `eventN` 번호
-대신 안정적인 udev/하드웨어 식별 정보를 `[[devices]]`에 저장합니다. 해당 장치의
-보정만 교체하며 다른 항목은 유지합니다. 측정하지 않은 가장자리는 추론할 수 없으므로
-전체 표면을 훑으세요. `q`, EOF, 인터럽트로 취소하면 저장하지 않습니다.
-저장이 성공하면 TOML 주석과 서식을 다시 생성합니다.
+설정은 장치를 선택하고 현재 좌표의 최솟값/최댓값을 기록한 뒤 udev/하드웨어 식별 정보를 `[[devices]]`에 저장합니다.
+측정하지 않은 가장자리는 추론할 수 없으므로 터치패드의 전체 표면을 인식하세요.
 
-전역 설정은 모든 `[[devices]]` 테이블보다 앞에 둡니다.
+/etc/e-motional-lib/config.toml
 
 ```toml
 edge_percent_x = 5.0
-edge_percent_y = 5.0
-max_speed_scale = 0.3
+edge_percent_y = 7.0
+max_speed_scale = 0.1
 dwell_ms = 150
 # Optional cap on each edge zone's physical width:
 # edge_width_mm = 2.0
 ```
 
-`edge_width_mm`는 각 가장자리 영역의 물리적 너비에 적용할 선택적 상한입니다.
-가장자리 비율은 0보다 크고 50보다 작아야 합니다. 속도 배율과 선택적 너비 상한은
-유한한 양수여야 합니다. 장치 범위는 최솟값과 최댓값이 유한하고 올바른 순서여야 합니다.
-잘못된 설정을 기본값으로 조용히 대체하지 않고 오류로 처리합니다. 설정을 변경하면
-프로젝트 서비스를 다시 시작해야 합니다. 터치패드 식별 정보는 최대 32개까지 설정할 수
-있습니다. 제한된 브로커 프로토콜로 처리할 수 없는 설정은 설정 과정에서 거부합니다.
 
-`--list-devices`는 이동을 주입하지 않고 장치/식별 정보/범위를 출력합니다.
-`--setup`/`-s`는 보정을 실행합니다. `--edge-width-mm`, `--max-speed-scale`,
-`--dwell-ms`는 설정/목록 조회 시 값을 덮어쓰며, 설정 시에는 저장됩니다.
-서비스의 이동 설정은 임의의 워커 플래그가 아니라 root 설정 파일에서 가져옵니다.
-`--verbose`는 디버그 로깅을, `--dbg`/`-d`는 지원되는 곳에서 상세 추적을 활성화합니다.
-`RUST_LOG`로 로깅을 제어합니다. 추적 로그에는 원시 좌표와 시간 정보가 포함될 수 있습니다.
 
-```sh
-sudo e-motional-lib --list-devices --config-path /etc/e-motional-lib/config.toml
-sudo systemctl status e-motional-lib e-motional-lib-broker.socket e-motional-lib-broker.service
-sudo journalctl -u e-motional-lib -u e-motional-lib-broker -f
-sudo systemctl restart e-motional-lib
-sudo systemctl disable --now e-motional-lib
-```
-
-추가 이동이 없으면 journal, 설정된 장치 식별 정보, `ID_INPUT_TOUCHPAD`/seat 태그,
-`/dev/uinput` 사용 가능 여부, root DAC 권한, 활성 logind 세션을 확인하세요.
-시작 또는 세션 전환 후에는 모든 손가락을 완전히 떼고 중앙에서 접촉을 시작하세요.
-문제를 해결하려고 `chmod`, 그룹 가입, ACL 변경, `xhost`, 디스플레이 인증 정보를
-사용하지 마세요. 입력 접근 권한을 넓히는 대신 해당 시스템의 정책을 조사하세요.
-
-## 업그레이드 및 제거
-
-관리 중인 소스 설치를 업그레이드하려면 소스 설치 프로그램을 다시 실행하고 보정을
-검토한 뒤 서비스를 명시적으로 다시 시작합니다. 해시가 일치하는 관리 파일만 교체하며,
-로컬에서 수정한 유닛이나 제삼자의 바이너리는 덮어쓰지 않습니다. 사용자 정의가
-필요하면 설치를 직접 관리하세요. 보수적으로 동작하는 설치 프로그램은 시스템 유닛
-오버라이드/드롭인을 조용히 우회하지 않고 거부합니다.
-Arch 설치는 pacman으로 업그레이드/제거합니다.
+## 제거
 
 소스 설치를 제거하려면 먼저 메인 서비스를 중지하고 비활성화합니다.
 
@@ -319,18 +262,7 @@ sudo sha256sum --check /var/lib/e-motional-lib-installer/manifest
 `/usr/lib/systemd/system/e-motional-lib-broker.socket`)를 삭제합니다.
 설치 프로그램 소유의 `/var/lib/e-motional-lib-installer/manifest`와 그 빈 디렉터리를
 삭제한 뒤 `sudo systemctl daemon-reload`를 실행합니다.
-보정 정보를 명시적으로 지우려는 경우가 아니면 `/etc/e-motional-lib/config.toml`을
-유지하세요. 설정 디렉터리는 비어 있을 때만 삭제합니다. 무관한 파일, 이전 사용자 유닛,
-기존 권한 규칙, 계정, 그룹을 삭제하거나 다른 애플리케이션이 사용하는 uinput을
-언로드하지 마세요.
 
-## 검증 상태
-
-이 변경 사항을 구현하는 동안 테스트 모음, 설치 프로그램, 서비스 시작, 실제 포인터
-이동 검사는 실행하지 않았습니다. 관련 로직에는 결정적인 Rust 테스트가 있으며
-PKGBUILD도 check 함수를 유지하지만, 이것이 테스트 통과를 의미하지는 않습니다.
-컴파일만으로는 systemd 활성화, 핫플러그, seat/세션 전환, 잠금 화면 동작,
-실제 X11/Wayland 포인터 이동을 검증할 수 없습니다. 지원 하드웨어에서 검증해야 합니다.
 
 ## 소스 구조
 
