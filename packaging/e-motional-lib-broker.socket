@@ -1,0 +1,13 @@
+[Unit]
+Description=e-motional-lib private root device broker socket
+PartOf=e-motional-lib.service
+
+[Socket]
+ListenStream=/run/e-motional-lib/broker.sock
+FileDescriptorName=broker-listener
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+DirectoryMode=0700
+RemoveOnStop=yes
+Service=e-motional-lib-broker.service
