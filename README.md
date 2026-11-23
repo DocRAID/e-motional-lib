@@ -1,5 +1,7 @@
 # e-motional-lib
 
+[한국어](README.ko.md)
+
 Keep moving the pointer when one finger reaches the edge of a touchpad, with or
 without a click held down. This is a Linux system service written in Rust, not a
 reusable library despite its name.
