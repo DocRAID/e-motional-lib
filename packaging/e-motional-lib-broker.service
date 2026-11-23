@@ -1,7 +1,9 @@
 [Unit]
 Description=e-motional-lib minimal root device broker
 Requires=e-motional-lib-broker.socket
-After=e-motional-lib-broker.socket systemd-logind.service
+BindsTo=systemd-logind.service
+Wants=modprobe@uinput.service
+After=e-motional-lib-broker.socket systemd-logind.service modprobe@uinput.service
 PartOf=e-motional-lib.service
 ConditionPathExists=/etc/e-motional-lib/config.toml
 ConditionPathExists=/dev/uinput

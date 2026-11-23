@@ -8,7 +8,7 @@ umask 077
 fail() { printf 'e-motional-lib: %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || fail 'Run this installer as root (sudo sh).'
 [ "$#" = 0 ] || fail 'This installer takes no arguments.'
-for command in curl systemctl systemd-run tar cargo rustc cc pkg-config sha256sum stat mktemp install awk; do
+for command in curl systemctl systemd-run tar cargo rustc cc pkg-config sha256sum stat mktemp install awk cp getent modprobe udevadm; do
     command -v "$command" >/dev/null 2>&1 || fail "Missing prerequisite: $command"
 done
 [ -d /run/systemd/system ] || fail 'A running systemd system manager is required.'
@@ -16,7 +16,7 @@ version=$(systemctl --version | awk 'NR == 1 { print $2 }')
 case "$version" in ''|*[!0-9]*) fail 'Cannot determine systemd version.' ;; esac
 [ "$version" -ge 253 ] || fail 'systemd 253 or newer is required (OpenFile= support).'
 pkg-config --exists libudev libsystemd || fail 'Install libudev and libsystemd development files.'
-[ -c /dev/uinput ] || fail '/dev/uinput is missing; load the uinput kernel module using your distribution policy, then retry.'
+[ -f /usr/lib/systemd/system/modprobe@.service ] || fail 'The standard systemd modprobe@.service unit is required.'
 [ -r /dev/tty ] && [ -w /dev/tty ] || fail 'Interactive calibration requires a controlling terminal (/dev/tty).'
 
 if awk -F: '$1 == "e-motional-lib" { found = 1 } END { exit !found }' /etc/passwd /etc/group; then
@@ -112,6 +112,11 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 check_destinations
+if [ ! -c /dev/uinput ]; then
+    modprobe uinput || fail 'Cannot load uinput under the existing kernel/security policy.'
+    udevadm settle --timeout=10 || fail 'udev did not finish creating the uinput device.'
+    [ -c /dev/uinput ] || fail '/dev/uinput is unavailable; existing device/security policy was not changed.'
+fi
 work=$(mktemp -d /var/tmp/e-motional-lib-install.XXXXXXXX)
 
 # Resolve main once so the source and service units come from the same revision.
@@ -164,10 +169,23 @@ if [ -f "$manifest" ]; then
     printf 'Stopping the project system units for upgrade and interactive calibration; they will remain stopped.\n'
     systemctl stop e-motional-lib.service e-motional-lib-broker.socket e-motional-lib-broker.service
 fi
+# Recheck NSS after stopping our DynamicUser: never reuse a static or directory-service identity.
+for database in passwd group; do
+    if getent "$database" e-motional-lib >/dev/null; then
+        fail "An existing $database identity named e-motional-lib would defeat DynamicUser isolation."
+    else
+        status=$?
+        [ "$status" = 2 ] || fail "Cannot safely check $database identity conflicts (getent status $status)."
+    fi
+done
 replace_file() {
     source=$1 destination=$2 mode=$3
     staging=$(mktemp -d "${destination%/*}/.e-motional-lib.XXXXXXXX")
     install -m "$mode" "$source" "$staging/file"
+    if [ -e "$destination" ]; then
+        # Copy attributes onto the new inode, never chmod/chown the existing resource.
+        cp --attributes-only --preserve=mode,ownership,xattr -- "$destination" "$staging/file"
+    fi
     mv -fT "$staging/file" "$destination"
     rmdir "$staging"
     staging=

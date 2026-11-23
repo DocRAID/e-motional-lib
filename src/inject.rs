@@ -1,56 +1,31 @@
-use enigo::{Coordinate, Enigo, InputResult, Mouse, Settings};
+use evdev::{uinput::VirtualDevice, AttributeSet, EventType, InputEvent, KeyCode, PropType, RelativeAxisCode};
+use std::io;
 
-#[cfg(any(
-    all(feature = "x11", feature = "wayland"),
-    not(any(feature = "x11", feature = "wayland"))
-))]
-compile_error!(
-    "Select exactly one Enigo backend: default X11, or --no-default-features --features wayland"
-);
-
-const BACKEND: &str = if cfg!(feature = "wayland") {
-    "Wayland"
-} else {
-    "X11"
-};
-
-pub struct Injector(Enigo);
+pub struct Injector(VirtualDevice);
 
 impl Injector {
     pub fn new() -> Result<Self, String> {
-        log::debug!(
-            "connecting Enigo {BACKEND}: DISPLAY={:?} WAYLAND_DISPLAY={:?} XDG_RUNTIME_DIR={:?}",
-            std::env::var_os("DISPLAY"),
-            std::env::var_os("WAYLAND_DISPLAY"),
-            std::env::var_os("XDG_RUNTIME_DIR")
-        );
-        let settings = Settings {
-            linux_delay: 0,
-            // This daemon only moves the pointer; it never owns keyboard/button state.
-            release_keys_when_dropped: false,
-            ..Settings::default()
-        };
-        let cursor = Enigo::new(&settings).map_err(|error| {
-            let hint = if cfg!(feature = "wayland") {
-                "run in a Wayland session exposing virtual-pointer/virtual-keyboard protocols with WAYLAND_DISPLAY and XDG_RUNTIME_DIR; this build does not include libei/portal support"
-            } else {
-                "run as the logged-in X11 desktop user with DISPLAY and XAUTHORITY; use the Wayland build for a supported Wayland compositor"
-            };
-            format!("Enigo {BACKEND} connection failed: {error}; {hint}")
-        })?;
-        log::info!("cursor output: Enigo {BACKEND}, relative motion only");
-        Ok(Self(cursor))
+        let axes: AttributeSet<RelativeAxisCode> =
+            [RelativeAxisCode::REL_X, RelativeAxisCode::REL_Y].into_iter().collect();
+        // Mouse classification needs BTN_LEFT capability; no button events are emitted.
+        let keys: AttributeSet<KeyCode> = [KeyCode::BTN_LEFT].into_iter().collect();
+        let properties: AttributeSet<PropType> = [PropType::POINTER].into_iter().collect();
+        let device = VirtualDevice::builder()
+            .and_then(|builder| builder.with_relative_axes(&axes))
+            .and_then(|builder| builder.with_keys(&keys))
+            .and_then(|builder| builder.with_properties(&properties))
+            .and_then(|builder| builder.name("e-motional-lib virtual pointer").build())
+            .map_err(|error| format!("cannot create /dev/uinput relative pointer: {error}"))?;
+        Ok(Self(device))
     }
 
-    pub fn emit(&mut self, delta: [i32; 2]) -> InputResult<()> {
-        if delta != [0, 0] {
-            self.0.move_mouse(delta[0], delta[1], Coordinate::Rel)?;
-            log::trace!(
-                "Enigo {BACKEND} moved pointer dx={} dy={}",
-                delta[0],
-                delta[1]
-            );
+    pub fn emit(&mut self, delta: [i32; 2]) -> io::Result<()> {
+        if delta == [0, 0] {
+            return Ok(());
         }
-        Ok(())
+        self.0.emit(&[
+            InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_X.0, delta[0]),
+            InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_Y.0, delta[1]),
+        ])
     }
 }

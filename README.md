@@ -16,8 +16,9 @@ Requirements:
 
 - Linux with a running **systemd 253 or newer** and systemd-logind.
 - A local graphical X11 or Wayland user session on **seat0**.
-- The uinput kernel module/device, with existing device permissions allowing
-  root to read selected touchpads and open `/dev/uinput`.
+- The uinput kernel module/device and the standard `modprobe@.service` unit,
+  with existing device permissions allowing root to read selected touchpads and
+  open `/dev/uinput`.
 - For source installation: a system-wide stable Rust/Cargo toolchain, a C linker,
   pkg-config, libudev and libsystemd development files, curl, and standard GNU
   userland tools. A Rust toolchain installed only under somebody's home directory
@@ -31,9 +32,11 @@ On Arch Linux, install prerequisites with:
 sudo pacman -S --needed base-devel rust pkgconf systemd curl
 ```
 
-If `/dev/uinput` is absent, load the module according to your distribution's
-policy (for example, `sudo modprobe uinput`). The installer does not change
-module-loading policy, permissions, accounts, groups, ACLs, or udev rules.
+The installer loads `uinput` if its device is missing. At service startup the
+broker requests the distribution's standard `modprobe@uinput.service` unit.
+Neither step writes module-loading configuration or changes device permissions,
+accounts, groups, ACLs, or udev rules. A kernel/security policy that prevents
+loading or access causes a failure, not an automatic policy change.
 
 Install and calibrate, then explicitly enable the service:
 
@@ -53,7 +56,8 @@ Repeat setup later to authorize additional touchpads.
 1. Requires root, checks prerequisites and protected destination paths, and
    refuses unmanaged binaries, modified managed files, symlinks, unsafe existing
    configuration paths, conflicting system units/drop-ins, and a conflicting
-   local static `e-motional-lib` account or group. It does not repair permissions.
+   static `e-motional-lib` account or group. NSS identities are checked after
+   stopping a managed installation's DynamicUser. It does not repair permissions.
 2. Resolves upstream `main` to one GitHub commit and downloads that source archive
    and the three units from the same revision over HTTPS. There are no assumed
    prebuilt release assets.
@@ -64,8 +68,10 @@ Repeat setup later to authorize additional touchpads.
    for dependency downloads. Only its binary output is copied into root's staging
    area; the workspace is removed when the build unit stops.
 4. Installs the binary and system units, and records their SHA-256 hashes in a
-   private installer manifest. On managed upgrades it stops only this project's
-   system units before replacement/calibration and leaves them stopped.
+   private installer manifest. Replacement inodes preserve existing managed-file
+   ownership, permissions/ACLs, and extended attributes. On managed upgrades it
+   stops only this project's system units before replacement/calibration and
+   leaves them stopped.
 5. Reloads systemd's unit definitions and runs:
 
    ```sh
@@ -73,8 +79,10 @@ Repeat setup later to authorize additional touchpads.
    ```
 
    A new configuration directory is root-owned mode `0700`; a new configuration
-   file is root-owned mode `0600`. Existing owners and modes are preserved, not
-   changed. Existing system configuration must already have those private modes,
+   file is root-owned mode `0600`. Atomic replacement preserves existing owners,
+   modes, POSIX ACLs, and SELinux/Smack labels; inability to preserve these aborts
+   the save rather than weakening policy. Existing system configuration must
+   already have those private modes,
    be root-owned, and not be symlinked/hard-linked; other paths are rejected.
    Cancelled setup does not save; with no existing configuration the installer
    reports failure. With an existing configuration, cancellation leaves it intact.
@@ -149,7 +157,7 @@ motion. Edge-start contacts do not activate. Default edge zones are 5% per side
 on each axis. Deeper movement into the edge increases speed; corner motion can
 activate both axes. Inward hysteresis avoids flicker around a boundary.
 
-Lifting, a second finger, leaving the active zone, removal, invalid/stale input,
+Lifting, a second finger, leaving the active zone, removal, invalid input or stale IPC,
 or losing an eligible session stops extra motion. Startup, input overflow, and
 session transitions require a full lift before fresh contacts can activate.
 Physical input continues to work independently of either service process.
@@ -181,7 +189,7 @@ dependency cycle. It is not a public IPC service or an unrestricted FD broker.
 | --- | --- | --- |
 | DynamicUser worker | Executable/shared libraries, private process/device metadata, inherited broker connection and validated snapshots; no host config, home, evdev, uinput, or user-session sockets | Broker movement messages, journal output, private temporary space; no persistent host files |
 | Root broker | Root system config; selected `/dev/input` nodes; read-only `/sys`, `/run/udev`, `/run/systemd/{seats,sessions,users}`; inherited listening socket | `/dev/uinput` virtual relative movement and journal output; no persistent host config, physical evdev writes, or system/user D-Bus connections |
-| Root interactive setup | Candidate touchpad metadata and read-only input events; chosen config | Atomic selected calibration/config save, preserving existing file owner/mode |
+| Root interactive setup | Candidate touchpad metadata and read-only input events; chosen config | Atomic selected calibration/config save, preserving existing ownership, mode, POSIX ACLs, and SELinux/Smack labels |
 | Installer/build unit | Fixed upstream source/dependencies; system toolchain; isolated unprivileged build workspace | Installer's binary/three units/hash manifest, new config directory, setup config; build workspace/private temp and journal |
 
 The socket's runtime directory and node are created by the root system manager.
@@ -204,8 +212,10 @@ These temporary project resources are removed on normal completion/failure.
 
 This separation reduces the worker's authority; it does not make root broker,
 installer, dependency, or kernel bugs harmless. A compromised worker can request
-bounded pointer motion while eligible contacts/session state permit it. The
-broker's device sandbox covers the input-device class, while application-level
+bounded pointer motion while known single-contact/session state permits it:
+at most 128 relative counts per axis per output, with at least 8 ms between
+outputs. High speed settings are capped by this safety limit. The broker's
+device sandbox covers the input-device class, while application-level
 allowlisting limits the nodes actually opened. Raw contact coordinates and
 device identities are sensitive; review logs before sharing them.
 
@@ -268,6 +278,8 @@ Edge percentages must be strictly between 0 and 50. Speed scale and optional
 width cap must be finite positive values. Device ranges must have finite ordered
 min/max values. Invalid configuration is an error, not silently replaced with
 defaults. Changing settings requires restarting the project service.
+At most 32 touchpad identities may be configured. Setup rejects a configuration
+that the bounded broker protocol cannot handle.
 
 `--list-devices` prints devices/identities/ranges without injecting movement.
 `--setup`/`-s` calibrates. `--edge-width-mm`, `--max-speed-scale`, and `--dwell-ms`

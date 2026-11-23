@@ -1,17 +1,16 @@
 use crate::config::Calibration;
-use crate::edge::{Accumulator, Axis, Geometry, Motion, Settings};
-use crate::state::{Event, Tracker};
+use crate::edge::{Axis, Geometry, Settings};
+use crate::state::{Event, Frame, Tracker};
 use evdev::{raw_stream::RawDevice, AbsoluteAxisCode as Abs, KeyCode};
 use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 pub fn access_error(path: &Path, error: io::Error) -> String {
     if error.kind() == io::ErrorKind::PermissionDenied {
-        format!("{}: permission denied; grant evdev read access (for example, join the input group and re-login; this also permits reading keyboards), then run as your graphical-session user: {error}", path.display())
+        format!("{}: permission denied; use sudo e-motional-lib --setup for calibration, or start the installed system service; do not change device permissions or input-group memberships: {error}", path.display())
     } else {
         format!("{}: {error}", path.display())
     }
@@ -106,7 +105,7 @@ fn bootstrap(raw: &RawDevice, mt: bool, slots: usize) -> io::Result<(Tracker, bo
     Ok((tracker, !quiet(raw, slots)?))
 }
 
-fn calibration_id(device: &udev::Device, name: &str) -> String {
+pub fn calibration_id(device: &udev::Device, name: &str) -> String {
     let syspath = device.syspath().to_string_lossy();
     // inputN/eventN numbering is transient. Prefer udev's persistent port path.
     let location = device
@@ -120,7 +119,7 @@ fn calibration_id(device: &udev::Device, name: &str) -> String {
     format!("{location}|{name}")
 }
 
-fn calibrated_axes(id: &str, reported: [Axis; 2], calibrations: &[Calibration]) -> [Axis; 2] {
+pub fn calibrated_axes(id: &str, reported: [Axis; 2], calibrations: &[Calibration]) -> [Axis; 2] {
     match calibrations.iter().find(|calibration| calibration.id == id) {
         Some(calibration) => [
             Axis {
@@ -145,18 +144,43 @@ pub struct Touchpad {
     pub axes: [Axis; 2],
     pub raw: RawDevice,
     pub tracker: Tracker,
-    pub motion: Motion,
-    pub accumulator: Accumulator,
-    pub last_tick: Option<Instant>,
     multitouch: bool,
     slots: usize,
     quarantined: bool,
 }
 
 impl Touchpad {
-    pub fn open(
+    pub fn open_configured(
         device: &udev::Device,
         settings: Settings,
+        calibrations: &[Calibration],
+    ) -> Result<Option<Self>, String> {
+        if device.property_value("ID_INPUT_TOUCHPAD") != Some(std::ffi::OsStr::new("1"))
+            || device.property_value("ID_INPUT_KEYBOARD") == Some(std::ffi::OsStr::new("1"))
+            || device.property_value("ID_SEAT").is_some_and(|seat| seat != "seat0")
+        {
+            return Ok(None);
+        }
+        let Some(parent) = device.parent() else {
+            return Ok(None);
+        };
+        let Some(name) = parent.attribute_value("name") else {
+            return Ok(None);
+        };
+        let id = calibration_id(device, name.to_str().unwrap_or("unnamed"));
+        if !calibrations.iter().any(|calibration| calibration.id == id) {
+            return Ok(None);
+        }
+        let pad = Self::open(device, settings, false, calibrations)?;
+        if pad.as_ref().is_some_and(|pad| pad.id != id) {
+            return Err("touchpad identity changed during open; refusing device".into());
+        }
+        Ok(pad)
+    }
+
+    pub fn open(
+        device: &udev::Device,
+        _settings: Settings,
         list: bool,
         calibrations: &[Calibration],
     ) -> Result<Option<Self>, String> {
@@ -167,9 +191,21 @@ impl Touchpad {
             );
             return Ok(None);
         }
+        if device.property_value("ID_INPUT_KEYBOARD") == Some(std::ffi::OsStr::new("1")) {
+            log::warn!("{}: refusing keyboard-tagged touchpad", device.syspath().display());
+            return Ok(None);
+        }
+        if device.property_value("ID_SEAT").is_some_and(|seat| seat != "seat0") {
+            log::debug!("{}: skipping touchpad outside seat0", device.syspath().display());
+            return Ok(None);
+        }
         let Some(path) = device.devnode().filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.as_encoded_bytes().starts_with(b"event"))
+            p.parent() == Some(Path::new("/dev/input"))
+                && p.file_name().is_some_and(|name| {
+                    let name = name.as_encoded_bytes();
+                    name.strip_prefix(b"event")
+                        .is_some_and(|suffix| !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit))
+                })
         }) else {
             log::trace!(
                 "{}: skipped: no evdev event node",
@@ -181,7 +217,7 @@ impl Touchpad {
         // RawDevice::open tries O_RDWR first; use our own strictly O_RDONLY descriptor.
         let fd = match OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(path)
         {
             Ok(file) => file,
@@ -194,11 +230,19 @@ impl Touchpad {
             }
             Err(e) => return Err(access_error(path, e)),
         };
+        let metadata = fd.metadata().map_err(|error| access_error(path, error))?;
+        if !metadata.file_type().is_char_device() || device.devnum() != Some(metadata.rdev()) {
+            return Err(format!("{}: device identity mismatch; refusing input", path.display()));
+        }
         let raw = RawDevice::from_fd(fd.into()).map_err(|e| access_error(path, e))?;
         let Some(keys) = raw.supported_keys() else {
             log::debug!("{}: skipped: no key capabilities", path.display());
             return Ok(None);
         };
+        if keys.iter().any(|key| key.0 > 0 && key.0 < 0x100) {
+            log::warn!("{}: refusing keyboard-capable event node", path.display());
+            return Ok(None);
+        }
         if !keys.contains(KeyCode::BTN_LEFT) && !keys.contains(KeyCode::BTN_TOOL_FINGER) {
             log::debug!(
                 "{}: skipped: neither BTN_LEFT nor BTN_TOOL_FINGER",
@@ -307,9 +351,6 @@ impl Touchpad {
             axes: reported_axes,
             raw,
             tracker,
-            motion: Motion::new(geometry, settings),
-            accumulator: Accumulator::default(),
-            last_tick: None,
             multitouch: mt,
             slots: slot_count,
             quarantined,
@@ -320,15 +361,22 @@ impl Touchpad {
         self.raw.as_raw_fd()
     }
 
-    // Every SYN_REPORT is evaluated before any timer injection, including stop frames.
-    pub fn drain(&mut self) -> io::Result<bool> {
+    /// Session transitions require a full lift before any new motion can activate.
+    pub fn quarantine(&mut self) {
+        self.quarantined = true;
+        self.tracker.reset();
+    }
+
+    // Forward every committed frame; only the worker calculates motion.
+    pub fn drain_frames(&mut self, mut frame_ready: impl FnMut(&Frame)) -> io::Result<bool> {
+        let stopped = Frame::default();
         loop {
             let events = match self.raw.fetch_events() {
                 Ok(events) => events,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) if e.raw_os_error() == Some(libc::ENODEV) => return Ok(false),
-                Err(e) => return Err(e),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.raw_os_error() == Some(libc::ENODEV) => return Ok(false),
+                Err(error) => return Err(error),
             };
             let mut received = false;
             for event in events {
@@ -336,47 +384,15 @@ impl Touchpad {
                 log::trace!("{}: evdev {event:?}", self.path.display());
                 if event.event_type().0 == 0 && event.code() == 3 {
                     self.quarantined = true;
-                    self.motion.reset();
-                    self.last_tick = None;
-                    self.accumulator.reset();
-                    log::warn!(
-                        "{}: input overflow; waiting for fresh contact state",
-                        self.path.display()
-                    );
+                    frame_ready(&stopped);
+                    log::warn!("{}: input overflow; waiting for full lift", self.path.display());
                 }
                 if let Some(frame) = self.tracker.event(Event {
                     kind: event.event_type().0,
                     code: event.code(),
                     value: event.value(),
                 }) {
-                    let now = Instant::now();
-                    let was_active = self.last_tick.is_some();
-                    log::trace!(
-                        "{}: SYN_REPORT quarantined={} frame={frame:?}",
-                        self.path.display(),
-                        self.quarantined
-                    );
-                    if self.quarantined {
-                        self.motion.reset();
-                    } else {
-                        self.motion.update(frame, now);
-                    }
-                    log::trace!(
-                        "{}: frame result active={} velocity_px_s={:?} dwell_remaining_ms={:?}",
-                        self.path.display(),
-                        self.motion.active(now),
-                        self.motion.velocity(now),
-                        self.motion
-                            .deadline()
-                            .map(|deadline| deadline.saturating_duration_since(now).as_millis())
-                    );
-                    if was_active && !self.motion.active(now) {
-                        log::debug!("{}: motion deactivated", self.path.display());
-                    }
-                    if !self.motion.active(now) {
-                        self.last_tick = None;
-                        self.accumulator.reset();
-                    }
+                    frame_ready(if self.quarantined { &stopped } else { frame });
                 }
             }
             if !received {
@@ -384,16 +400,7 @@ impl Touchpad {
             }
         }
         if self.quarantined && quiet(&self.raw, self.slots)? {
-            log::debug!(
-                "{}: full lift detected; reinitializing input state",
-                self.path.display()
-            );
             (self.tracker, self.quarantined) = bootstrap(&self.raw, self.multitouch, self.slots)?;
-            log::debug!(
-                "{}: input state reinitialized quarantined={}",
-                self.path.display(),
-                self.quarantined
-            );
         }
         Ok(true)
     }
@@ -403,7 +410,8 @@ impl Touchpad {
 mod tests {
     use super::*;
     use crate::state::{Contact, Frame};
-    use std::time::Duration;
+    use crate::edge::Motion;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn only_matching_calibration_changes_trigger_coordinates() {

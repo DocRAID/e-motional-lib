@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -8,6 +10,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::edge::{Settings, DEFAULT_DWELL_MS, DEFAULT_EDGE_PERCENT, DEFAULT_MAX_SPEED_SCALE};
+
+pub const SYSTEM_PATH: &str = "/etc/e-motional-lib/config.toml";
 
 const MAX_POSITIVE_SETTING: f64 = 1_000_000.0;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -70,6 +74,9 @@ impl Config {
                 }
             }
         }
+        if self.devices.len() > crate::protocol::MAX_DEVICES {
+            return Err(format!("at most {} touchpads may be configured", crate::protocol::MAX_DEVICES));
+        }
         let mut ids = HashSet::new();
         for calibration in &self.devices {
             if calibration.id.trim().is_empty() {
@@ -105,10 +112,50 @@ impl Config {
 }
 
 pub fn path() -> Result<PathBuf, String> {
+    if unsafe { libc::geteuid() } == 0 {
+        return Ok(PathBuf::from(SYSTEM_PATH));
+    }
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .ok_or_else(|| "HOME is not set; cannot locate ~/.config/e-motional-lib.toml".to_owned())?;
     Ok(PathBuf::from(home).join(".config/e-motional-lib.toml"))
+}
+
+pub fn check_system_path(create: bool) -> Result<(), String> {
+    let parent = Path::new(SYSTEM_PATH).parent().unwrap();
+    let check_directory = |path: &Path, private: bool| -> Result<(), String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        let unsafe_mode = if private {
+            metadata.mode() & 0o7777 != 0o700
+        } else {
+            metadata.mode() & 0o022 != 0
+        };
+        if !metadata.is_dir() || metadata.uid() != 0 || unsafe_mode {
+            return Err(format!("{} must be a root-owned, non-symlink {}directory; existing permissions will not be changed",
+                path.display(), if private { "0700 " } else { "non-writable-by-others " }));
+        }
+        Ok(())
+    };
+    check_directory(Path::new("/etc"), false)?;
+    if create {
+        match fs::DirBuilder::new().mode(0o700).create(parent) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("cannot create {}: {error}", parent.display())),
+        }
+    }
+    check_directory(parent, true)?;
+    match fs::symlink_metadata(SYSTEM_PATH) {
+        Ok(metadata)
+            if metadata.is_file()
+                && metadata.uid() == 0
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o7777 == 0o600 => Ok(()),
+        Ok(_) => Err(format!("{SYSTEM_PATH} must be a root-owned private regular file, not a symlink or hard link; existing permissions will not be changed")),
+        Err(error) if create && error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot inspect {SYSTEM_PATH}: {error}; run sudo e-motional-lib --setup")),
+    }
 }
 
 pub fn load(path: &Path) -> Result<Config, String> {
@@ -133,6 +180,12 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
     config
         .validate()
         .map_err(|error| format!("cannot save config {}: {error}", path.display()))?;
+    let previous = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => Some(metadata),
+        Ok(_) => return Err(format!("refusing to replace non-regular or multiply linked config {}", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("cannot inspect config {}: {error}", path.display())),
+    };
     let text = toml::to_string_pretty(config)
         .map_err(|error| format!("cannot serialize config {}: {error}", path.display()))?;
     let parent = path
@@ -159,6 +212,7 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
         match OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&candidate)
         {
             Ok(file) => {
@@ -181,6 +235,54 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
         )
     })?;
     let result = (|| {
+        if let Some(metadata) = &previous {
+            let created = file.metadata()?;
+            if (created.uid(), created.gid()) != (metadata.uid(), metadata.gid())
+                && unsafe { libc::fchown(file.as_raw_fd(), metadata.uid(), metadata.gid()) } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // Preserve permission/security metadata on the replacement inode only.
+            let original = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?;
+            for name in [
+                b"system.posix_acl_access\0".as_slice(),
+                b"security.selinux\0".as_slice(),
+                b"security.SMACK64\0".as_slice(),
+            ] {
+                let size = unsafe {
+                    libc::fgetxattr(original.as_raw_fd(), name.as_ptr().cast(), std::ptr::null_mut(), 0)
+                };
+                if size >= 0 {
+                    let mut value = vec![0_u8; size as usize];
+                    let read = unsafe {
+                        libc::fgetxattr(original.as_raw_fd(), name.as_ptr().cast(), value.as_mut_ptr().cast(), value.len())
+                    };
+                    if read != size {
+                        return Err(io::Error::other("config security attributes changed while saving"));
+                    }
+                    if unsafe {
+                        libc::fsetxattr(file.as_raw_fd(), name.as_ptr().cast(), value.as_ptr().cast(), value.len(), 0)
+                    } < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                } else {
+                    let error = io::Error::last_os_error();
+                    if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+                        return Err(error);
+                    }
+                    if unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr().cast()) } < 0 {
+                        let error = io::Error::last_os_error();
+                        if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            file.set_permissions(metadata.permissions())?;
+        }
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         drop(file);
@@ -481,5 +583,48 @@ mod tests {
         fs::write(&parent_file, "untouched").unwrap();
         assert!(save(&parent_file.join("config.toml"), &Config::default()).is_err());
         assert_eq!(fs::read_to_string(parent_file).unwrap(), "untouched");
+    }
+
+    #[test]
+    fn save_keeps_private_creation_and_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = TestDirectory::new();
+        let path = directory.0.join("config.toml");
+        save(&path, &Config::default()).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o077, 0);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        save(&path, &Config { dwell_ms: 42, ..Config::default() }).unwrap();
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!((after.uid(), after.gid(), after.mode()), (before.uid(), before.gid(), before.mode()));
+        assert_eq!(load(&path).unwrap().dwell_ms, 42);
+    }
+
+    #[test]
+    fn save_refuses_symlinks_and_hard_links_without_touching_target() {
+        let directory = TestDirectory::new();
+        let target = directory.0.join("target.toml");
+        fs::write(&target, "dwell_ms = 42\n").unwrap();
+        let link = directory.0.join("link.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(save(&link, &Config::default()).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "dwell_ms = 42\n");
+        fs::remove_file(&link).unwrap();
+        fs::hard_link(&target, &link).unwrap();
+        assert!(save(&link, &Config::default()).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "dwell_ms = 42\n");
+    }
+
+    #[test]
+    fn setup_cannot_save_more_devices_than_the_broker_can_handle() {
+        let mut config = Config {
+            devices: (0..crate::protocol::MAX_DEVICES)
+                .map(|index| Calibration { id: format!("pad-{index}"), ..calibration() })
+                .collect(),
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+        config.devices.push(Calibration { id: "one-too-many".into(), ..calibration() });
+        assert!(config.validate().is_err());
     }
 }
